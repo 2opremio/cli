@@ -14,14 +14,17 @@ import (
 	"github.com/convox/cli/Godeps/_workspace/src/github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/convox/cli/Godeps/_workspace/src/github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/convox/cli/Godeps/_workspace/src/github.com/aws/aws-sdk-go/service/cloudformation"
+	"github.com/convox/cli/Godeps/_workspace/src/github.com/aws/aws-sdk-go/service/lambda"
+	"github.com/convox/cli/Godeps/_workspace/src/github.com/aws/aws-sdk-go/service/sns"
 	"github.com/convox/cli/Godeps/_workspace/src/github.com/codegangsta/cli"
 	"github.com/convox/cli/stdcli"
 )
 
-var FormationUrl = "http://convox.s3.amazonaws.com/release/latest/formation.json"
-
 // https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
 var lambdaRegions = map[string]bool{"us-east-1": true, "us-west-2": true, "eu-west-1": true, "ap-northeast-1": true}
+
+// https://docs.aws.amazon.com/general/latest/gr/rande.html#ecs_region
+var ecsRegions = map[string]bool{"us-east-1": true, "us-west-1": true, "us-west-2": true, "eu-west-1": true, "ap-northeast-1": true, "ap-southeast-2": true}
 
 func init() {
 	rand.Seed(time.Now().UTC().UnixNano())
@@ -104,8 +107,9 @@ func init() {
 
 func cmdInstall(c *cli.Context) {
 	region := c.String("region")
+	lambdaRegion := region
 
-	if !lambdaRegions[region] {
+	if !ecsRegions[region] {
 		stdcli.Error(fmt.Errorf("Convox is not currently supported in %s", region))
 	}
 
@@ -184,13 +188,96 @@ func cmdInstall(c *cli.Context) {
 	stackName := c.String("stack-name")
 
 	version := c.String("version")
+	if version == "" {
+		version = "latest"
+	}
+
+	var BootstrapUrl = fmt.Sprintf("http://convox.s3.amazonaws.com/release/%s/bootstrap.json", version)
+	var FormationUrl = fmt.Sprintf("http://convox.s3.amazonaws.com/release/%s/formation.json", version)
 
 	instanceCount := fmt.Sprintf("%d", c.Int("instance-count"))
 
-	fmt.Println("Installing Convox...")
-
 	access = strings.TrimSpace(access)
 	secret = strings.TrimSpace(secret)
+
+	fmt.Println("Installing Convox...")
+
+	externalCustomTopic := ""
+	if !lambdaRegions[region] {
+		lambdaRegion = "us-east-1"
+		fmt.Printf("Lambda is not supported in %s, creating bootstrap in %s:\n", region, lambdaRegion)
+
+		SNS := sns.New(&aws.Config{
+			Region:      region,
+			Credentials: credentials.NewStaticCredentials(access, secret, ""),
+		})
+
+		snsResp, err := SNS.CreateTopic(&sns.CreateTopicInput{
+			Name: aws.String(stackName + "-bootstrap"),
+		})
+
+		if err != nil {
+			handleError("install", distinctId, err)
+			return
+		}
+		externalCustomTopic = *snsResp.TopicARN
+
+		BootstrapCloudFormation := cloudformation.New(&aws.Config{
+			Region:      lambdaRegion,
+			Credentials: credentials.NewStaticCredentials(access, secret, ""),
+		})
+
+		bres, err := BootstrapCloudFormation.CreateStack(&cloudformation.CreateStackInput{
+			Capabilities: []*string{aws.String("CAPABILITY_IAM")},
+			Parameters: []*cloudformation.Parameter{
+				&cloudformation.Parameter{ParameterKey: aws.String("Version"), ParameterValue: aws.String(version)},
+			},
+			StackName:   aws.String(stackName + "-bootstrap"),
+			TemplateURL: aws.String(BootstrapUrl),
+		})
+
+		if err != nil {
+			handleError("install", distinctId, err)
+			return
+		}
+
+		bootstrap, err := waitForCompletion(*bres.StackID, BootstrapCloudFormation, false)
+
+		if err != nil {
+			handleError("install", distinctId, err)
+			return
+		}
+
+		Lambda := lambda.New(&aws.Config{
+			Region:      lambdaRegion,
+			Credentials: credentials.NewStaticCredentials(access, secret, ""),
+		})
+
+		_, err = Lambda.AddPermission(&lambda.AddPermissionInput{
+			Action:       aws.String("lambda:invokeFunction"),
+			FunctionName: aws.String(bootstrap),
+			StatementID:  aws.String("StatementID"),
+			Principal:    aws.String("sns.amazonaws.com"),
+			SourceARN:    aws.String(externalCustomTopic),
+		})
+
+		if err != nil {
+			handleError("install", distinctId, err)
+			return
+		}
+
+		_, err = SNS.Subscribe(&sns.SubscribeInput{
+			Protocol: aws.String("lambda"),
+			TopicARN: aws.String(externalCustomTopic),
+			Endpoint: aws.String(bootstrap),
+		})
+
+		if err != nil {
+			handleError("install", distinctId, err)
+			return
+		}
+		fmt.Println("Continuing normal install...")
+	}
 
 	password := randomString(30)
 
@@ -199,7 +286,7 @@ func cmdInstall(c *cli.Context) {
 		Credentials: credentials.NewStaticCredentials(access, secret, ""),
 	})
 
-	res, err := CloudFormation.CreateStack(&cloudformation.CreateStackInput{
+	stackInput := &cloudformation.CreateStackInput{
 		Capabilities: []*string{aws.String("CAPABILITY_IAM")},
 		Parameters: []*cloudformation.Parameter{
 			&cloudformation.Parameter{ParameterKey: aws.String("ClientId"), ParameterValue: aws.String(distinctId)},
@@ -213,7 +300,13 @@ func cmdInstall(c *cli.Context) {
 		},
 		StackName:   aws.String(stackName),
 		TemplateURL: aws.String(FormationUrl),
-	})
+	}
+
+	if externalCustomTopic != "" {
+		stackInput.Parameters = append(stackInput.Parameters, &cloudformation.Parameter{ParameterKey: aws.String("ExternalCustomTopic"), ParameterValue: aws.String(externalCustomTopic)})
+	}
+
+	res, err := CloudFormation.CreateStack(stackInput)
 
 	if err != nil {
 		sendMixpanelEvent(fmt.Sprintf("convox-install-error"), err.Error())
@@ -418,7 +511,7 @@ func waitForCompletion(stack string, CloudFormation *cloudformation.CloudFormati
 			}
 
 			for _, o := range dres.Stacks[0].Outputs {
-				if *o.OutputKey == "Dashboard" {
+				if *o.OutputKey == "Dashboard" || *o.OutputKey == "Bootstrap" {
 					return *o.OutputValue, nil
 				}
 			}
@@ -527,9 +620,9 @@ func friendlyName(t string) string {
 		return "Routing Table"
 	case "AWS::EC2::SecurityGroup":
 		return "Security Group"
-	case "AWS::EC2::Subnet":
+	case "Custom::EC2Subnets":
 		return "VPC Subnet"
-	case "AWS::EC2::SubnetRouteTableAssociation":
+	case "Custom::EC2SubnetRouteTableAssociation":
 		return ""
 	case "AWS::EC2::VPC":
 		return "VPC"
