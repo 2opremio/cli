@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
@@ -206,6 +207,10 @@ func cmdInstall(c *cli.Context) {
 		Credentials: credentials.NewStaticCredentials(access, secret, ""),
 	})
 
+	template, err := ioutil.ReadFile("/home/vagrant/convox/kernel/dist/kernel.json")
+	if err != nil {
+		panic("Can't find file")
+	}
 	res, err := CloudFormation.CreateStack(&cloudformation.CreateStackInput{
 		Capabilities: []*string{aws.String("CAPABILITY_IAM")},
 		Parameters: []*cloudformation.Parameter{
@@ -219,8 +224,9 @@ func cmdInstall(c *cli.Context) {
 			&cloudformation.Parameter{ParameterKey: aws.String("Tenancy"), ParameterValue: aws.String(tenancy)},
 			&cloudformation.Parameter{ParameterKey: aws.String("Version"), ParameterValue: aws.String(version)},
 		},
-		StackName:   aws.String(stackName),
-		TemplateURL: aws.String(FormationUrl),
+		StackName: aws.String(stackName),
+		//TemplateURL: aws.String(FormationUrl),
+		TemplateBody: aws.String(string(template)),
 	})
 
 	if err != nil {
