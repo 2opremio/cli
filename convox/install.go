@@ -36,6 +36,11 @@ func init() {
 				Name:  "dedicated",
 				Usage: "create EC2 instances on dedicated hardware",
 			},
+			cli.StringFlag{
+				Name:  "iam-ec2-actions",
+				Value: "",
+				Usage: "comma-delimited list of additional allowed IAM Actions",
+			},
 			cli.IntFlag{
 				Name:  "instance-count",
 				Value: 3,
@@ -187,6 +192,8 @@ func cmdInstall(c *cli.Context) {
 
 	instanceCount := fmt.Sprintf("%d", c.Int("instance-count"))
 
+	iamEC2Actions := c.String("iam-ec2-actions")
+
 	fmt.Println("Installing Convox...")
 
 	access = strings.TrimSpace(access)
@@ -204,6 +211,7 @@ func cmdInstall(c *cli.Context) {
 		Parameters: []*cloudformation.Parameter{
 			&cloudformation.Parameter{ParameterKey: aws.String("ClientId"), ParameterValue: aws.String(distinctId)},
 			&cloudformation.Parameter{ParameterKey: aws.String("Development"), ParameterValue: aws.String(development)},
+			&cloudformation.Parameter{ParameterKey: aws.String("IamEc2Actions"), ParameterValue: aws.String(iamEC2Actions)},
 			&cloudformation.Parameter{ParameterKey: aws.String("InstanceCount"), ParameterValue: aws.String(instanceCount)},
 			&cloudformation.Parameter{ParameterKey: aws.String("InstanceType"), ParameterValue: aws.String(instanceType)},
 			&cloudformation.Parameter{ParameterKey: aws.String("Key"), ParameterValue: aws.String(key)},
